@@ -59,20 +59,39 @@ model ServiceInstance {
 }
 
 model Route {
-  id          String    @id @default(uuid())
-  serviceId   String
-  path        String
-  method      String?   @default("*")
-  rewritePath String?
-  authType    AuthType  @default(NONE)
-  enabled     Boolean   @default(true)
-  extraHeaders Json?
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  id            String    @id @default(uuid())
+  serviceId     String
+  path          String
+  method        String?   @default("*")
+  rewritePath   String?
+  authType      AuthType  @default(NONE)
+  enabled       Boolean   @default(true)
+  extraHeaders  Json?
+  rateLimitQps  Int?
+  ipRateLimitQps Int?
+  tenantId      String?
+  grayRules     Json?
+  grayUpstream  String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
   
-  service     Service   @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  service       Service   @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  tenant        Tenant?   @relation(fields: [tenantId], references: [id], onDelete: SetNull)
   
   @@map("routes")
+}
+
+model Tenant {
+  id            String    @id @default(uuid())
+  name          String    @unique
+  rateLimitQps  Int
+  enabled       Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  
+  routes        Route[]
+  
+  @@map("tenants")
 }
 
 model RateLimitRule {

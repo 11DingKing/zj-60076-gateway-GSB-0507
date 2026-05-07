@@ -1,7 +1,40 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { RedisService } from '../redis/redis.service';
-import { RateLimitRule } from '@prisma/client';
+import { CreateTenantDto } from './dto/create-tenant.dto';
+import { UpdateTenantDto } from './dto/update-tenant.dto';
+
+const SLIDING_WINDOW_LUA = `
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window_ms = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window_ms)
+
+local count = redis.call('ZCARD', key)
+
+if count < limit then
+  redis.call('ZADD', key, now, now .. ':' .. math.random(1, 1000000))
+  redis.call('PEXPIRE', key, window_ms + 1000)
+  return { 1, limit - count - 1, 0 }
+else
+  local earliest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+  local reset_ms = 0
+  if #earliest >= 2 then
+    reset_ms = tonumber(earliest[2]) + window_ms - now
+    if reset_ms < 0 then reset_ms = 0 end
+  end
+  return { 0, 0, reset_ms }
+end
+`;
+
+export interface RateLimitResult {
+  allowed: boolean;
+  remaining: number;
+  resetMs: number;
+  scope: string | null;
+}
 
 @Injectable()
 export class RateLimitService {
@@ -10,141 +43,164 @@ export class RateLimitService {
     private redisService: RedisService,
   ) {}
 
-  async create(createRateLimitRuleDto: any) {
-    return this.prisma.rateLimitRule.create({
-      data: createRateLimitRuleDto,
+  async createTenant(dto: CreateTenantDto) {
+    return this.prisma.tenant.create({ data: dto });
+  }
+
+  async findAllTenants() {
+    return this.prisma.tenant.findMany({
+      orderBy: { createdAt: 'desc' },
+      include: { routes: true },
     });
   }
 
-  async findAll() {
-    return this.prisma.rateLimitRule.findMany({
-      orderBy: {
-        createdAt: 'desc',
-      },
-    });
-  }
-
-  async findOne(id: string) {
-    return this.prisma.rateLimitRule.findUnique({
+  async findOneTenant(id: string) {
+    return this.prisma.tenant.findUnique({
       where: { id },
+      include: { routes: true },
     });
   }
 
-  async update(id: string, updateRateLimitRuleDto: any) {
+  async updateTenant(id: string, dto: UpdateTenantDto) {
+    return this.prisma.tenant.update({
+      where: { id },
+      data: { ...dto, updatedAt: new Date() },
+    });
+  }
+
+  async removeTenant(id: string) {
+    return this.prisma.tenant.delete({ where: { id } });
+  }
+
+  async checkRateLimit(
+    routeId: string,
+    routePath: string,
+    rateLimitQps: number | null,
+    ipRateLimitQps: number | null,
+    tenantId: string | null,
+    clientIp: string,
+  ): Promise<RateLimitResult> {
+    const now = Date.now();
+    const windowMs = 1000;
+    let strictest: RateLimitResult = {
+      allowed: true,
+      remaining: Infinity,
+      resetMs: 0,
+      scope: null,
+    };
+
+    if (rateLimitQps !== null && rateLimitQps !== undefined) {
+      const routeResult = await this.slidingWindowCheck(
+        `ratelimit:route:${routeId}`,
+        now,
+        windowMs,
+        rateLimitQps,
+      );
+      const result: RateLimitResult = {
+        allowed: routeResult[0] === 1,
+        remaining: routeResult[1],
+        resetMs: routeResult[2],
+        scope: 'route',
+      };
+      if (!result.allowed || this.isStricter(result, strictest)) {
+        strictest = result;
+      }
+    }
+
+    if (ipRateLimitQps !== null && ipRateLimitQps !== undefined) {
+      const ipResult = await this.slidingWindowCheck(
+        `ratelimit:ip:${routeId}:${clientIp}`,
+        now,
+        windowMs,
+        ipRateLimitQps,
+      );
+      const result: RateLimitResult = {
+        allowed: ipResult[0] === 1,
+        remaining: ipResult[1],
+        resetMs: ipResult[2],
+        scope: 'ip',
+      };
+      if (!result.allowed || this.isStricter(result, strictest)) {
+        strictest = result;
+      }
+    }
+
+    if (tenantId) {
+      const tenant = await this.prisma.tenant.findUnique({
+        where: { id: tenantId },
+      });
+      if (tenant && tenant.enabled) {
+        const tenantResult = await this.slidingWindowCheck(
+          `ratelimit:tenant:${tenantId}`,
+          now,
+          windowMs,
+          tenant.rateLimitQps,
+        );
+        const result: RateLimitResult = {
+          allowed: tenantResult[0] === 1,
+          remaining: tenantResult[1],
+          resetMs: tenantResult[2],
+          scope: 'tenant',
+        };
+        if (!result.allowed || this.isStricter(result, strictest)) {
+          strictest = result;
+        }
+      }
+    }
+
+    if (strictest.remaining === Infinity) {
+      strictest.remaining = 0;
+    }
+
+    return strictest;
+  }
+
+  private isStricter(a: RateLimitResult, b: RateLimitResult): boolean {
+    if (!a.allowed && b.allowed) return true;
+    if (a.allowed && !b.allowed) return false;
+    return a.remaining < b.remaining;
+  }
+
+  private async slidingWindowCheck(
+    key: string,
+    now: number,
+    windowMs: number,
+    limit: number,
+  ): Promise<number[]> {
+    const client = this.redisService.getClient();
+    const result = await client.eval(
+      SLIDING_WINDOW_LUA,
+      1,
+      key,
+      now.toString(),
+      windowMs.toString(),
+      limit.toString(),
+    );
+    return result as number[];
+  }
+
+  async createRateLimitRule(dto: any) {
+    return this.prisma.rateLimitRule.create({ data: dto });
+  }
+
+  async findAllRateLimitRules() {
+    return this.prisma.rateLimitRule.findMany({
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  async findOneRateLimitRule(id: string) {
+    return this.prisma.rateLimitRule.findUnique({ where: { id } });
+  }
+
+  async updateRateLimitRule(id: string, dto: any) {
     return this.prisma.rateLimitRule.update({
       where: { id },
-      data: {
-        ...updateRateLimitRuleDto,
-        updatedAt: new Date(),
-      },
+      data: { ...dto, updatedAt: new Date() },
     });
   }
 
-  async remove(id: string) {
-    return this.prisma.rateLimitRule.delete({
-      where: { id },
-    });
-  }
-
-  async matchRule(
-    path: string,
-    method: string,
-  ): Promise<RateLimitRule | null> {
-    const rules = await this.prisma.rateLimitRule.findMany({
-      where: {
-        enabled: true,
-      },
-    });
-
-    for (const rule of rules) {
-      if (this.pathMatches(rule.path, path) && this.methodMatches(rule.method, method)) {
-        return rule;
-      }
-    }
-
-    return null;
-  }
-
-  private pathMatches(rulePath: string, requestPath: string): boolean {
-    if (rulePath === requestPath) {
-      return true;
-    }
-
-    if (rulePath.endsWith('/*')) {
-      const prefix = rulePath.slice(0, -2);
-      return requestPath === prefix || requestPath.startsWith(prefix + '/');
-    }
-
-    return false;
-  }
-
-  private methodMatches(ruleMethod: string | null, requestMethod: string): boolean {
-    if (!ruleMethod || ruleMethod === '*') {
-      return true;
-    }
-
-    return ruleMethod.toUpperCase() === requestMethod.toUpperCase();
-  }
-
-  async isAllowed(
-    rule: RateLimitRule,
-    ip: string,
-    userId?: string,
-  ): Promise<{ allowed: boolean; retryAfter?: number }> {
-    const key = this.generateKey(rule, ip, userId);
-
-    const now = Math.floor(Date.now() / 1000);
-
-    if (rule.limitPerSecond !== undefined && rule.limitPerSecond !== null) {
-      const secondKey = `${key}:second:${now}`;
-      const secondCount = await this.redisService.incr(secondKey);
-      if (secondCount === 1) {
-        await this.redisService.expire(secondKey, 1);
-      }
-      if (secondCount > rule.limitPerSecond) {
-        return { allowed: false, retryAfter: 1 };
-      }
-    }
-
-    if (rule.limitPerMinute !== undefined && rule.limitPerMinute !== null) {
-      const minute = Math.floor(now / 60);
-      const minuteKey = `${key}:minute:${minute}`;
-      const minuteCount = await this.redisService.incr(minuteKey);
-      if (minuteCount === 1) {
-        await this.redisService.expire(minuteKey, 60);
-      }
-      if (minuteCount > rule.limitPerMinute) {
-        const remainingSeconds = 60 - (now % 60);
-        return { allowed: false, retryAfter: remainingSeconds };
-      }
-    }
-
-    if (rule.limitPerHour !== undefined && rule.limitPerHour !== null) {
-      const hour = Math.floor(now / 3600);
-      const hourKey = `${key}:hour:${hour}`;
-      const hourCount = await this.redisService.incr(hourKey);
-      if (hourCount === 1) {
-        await this.redisService.expire(hourKey, 3600);
-      }
-      if (hourCount > rule.limitPerHour) {
-        const remainingSeconds = 3600 - (now % 3600);
-        return { allowed: false, retryAfter: remainingSeconds };
-      }
-    }
-
-    return { allowed: true };
-  }
-
-  private generateKey(rule: RateLimitRule, ip: string, userId?: string): string {
-    switch (rule.dimension.toLowerCase()) {
-      case 'ip':
-        return `ratelimit:${rule.id}:ip:${ip}`;
-      case 'user':
-        return `ratelimit:${rule.id}:user:${userId || 'anonymous'}`;
-      case 'path':
-        return `ratelimit:${rule.id}:path:${rule.path}`;
-      default:
-        return `ratelimit:${rule.id}:ip:${ip}`;
-    }
+  async removeRateLimitRule(id: string) {
+    return this.prisma.rateLimitRule.delete({ where: { id } });
   }
 }

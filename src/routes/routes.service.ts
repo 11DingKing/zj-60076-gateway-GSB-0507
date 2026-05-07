@@ -23,6 +23,7 @@ export class RoutesService {
       },
       include: {
         service: true,
+        tenant: true,
       },
     });
   }
@@ -31,6 +32,7 @@ export class RoutesService {
     return this.prisma.route.findMany({
       include: {
         service: true,
+        tenant: true,
       },
       orderBy: {
         createdAt: 'desc',
@@ -43,6 +45,7 @@ export class RoutesService {
       where: { id },
       include: {
         service: true,
+        tenant: true,
       },
     });
 
@@ -64,6 +67,7 @@ export class RoutesService {
       },
       include: {
         service: true,
+        tenant: true,
       },
     });
   }

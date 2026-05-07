@@ -13,7 +13,6 @@ import { LoadBalanceModule } from './load-balance/load-balance.module';
 import { HealthCheckModule } from './health-check/health-check.module';
 import { ProxyModule } from './proxy/proxy.module';
 import { AuthMiddleware } from './auth/auth.middleware';
-import { RateLimitMiddleware } from './rate-limit/rate-limit.middleware';
 import { RequestLogMiddleware } from './request-log/request-log.middleware';
 import { ProxyMiddleware } from './proxy/proxy.middleware';
 
@@ -39,7 +38,7 @@ import { ProxyMiddleware } from './proxy/proxy.middleware';
 export class AppModule {
   configure(consumer: MiddlewareConsumer) {
     consumer
-      .apply(RequestLogMiddleware, RateLimitMiddleware, AuthMiddleware, ProxyMiddleware)
+      .apply(RequestLogMiddleware, AuthMiddleware, ProxyMiddleware)
       .forRoutes({ path: '*', method: RequestMethod.ALL });
   }
 }
