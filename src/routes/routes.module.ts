@@ -1,12 +1,12 @@
-import { Module } from "@nestjs/common";
-import { RoutesService } from "./routes.service";
-import { GrayRouteService } from "./gray-route.service";
-import { RoutesController } from "./routes.controller";
-import { PrismaModule } from "../prisma/prisma.module";
-import { AuthModule } from "../auth/auth.module";
+import { Module, forwardRef } from '@nestjs/common';
+import { RoutesService } from './routes.service';
+import { GrayRouteService } from './gray-route.service';
+import { RoutesController } from './routes.controller';
+import { PrismaModule } from '../prisma/prisma.module';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
-  imports: [PrismaModule, AuthModule],
+  imports: [PrismaModule, forwardRef(() => AuthModule)],
   controllers: [RoutesController],
   providers: [RoutesService, GrayRouteService],
   exports: [RoutesService, GrayRouteService],

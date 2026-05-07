@@ -191,6 +191,7 @@ export class RateLimitService {
 
   private async checkRouteLevel(params: RateLimitCheckParams): Promise<SlidingWindowResult> {
     let routeQps: number | null = null;
+    let matchedRouteId: string | null = null;
 
     if (params.routeId) {
       const route = await this.prisma.route.findUnique({
@@ -198,6 +199,24 @@ export class RateLimitService {
       });
       if (route && route.rateLimitQps !== null && route.rateLimitQps !== undefined) {
         routeQps = route.rateLimitQps;
+        matchedRouteId = route.id;
+      }
+    }
+
+    if (routeQps === null) {
+      const routes = await this.prisma.route.findMany({
+        where: { enabled: true },
+      });
+
+      for (const route of routes) {
+        if (this.routePathMatches(route.path, params.routePath) &&
+            this.routeMethodMatches(route.method, params.routeMethod)) {
+          if (route.rateLimitQps !== null && route.rateLimitQps !== undefined) {
+            routeQps = route.rateLimitQps;
+            matchedRouteId = route.id;
+          }
+          break;
+        }
       }
     }
 
@@ -205,8 +224,22 @@ export class RateLimitService {
       return { allowed: true, remaining: Number.MAX_SAFE_INTEGER, reset: Date.now() + WINDOW_SIZE_MS };
     }
 
-    const key = `rl:route:${params.routeId || params.routePath}`;
+    const key = `rl:route:${matchedRouteId || params.routePath}`;
     return this.checkSlidingWindow(key, routeQps);
+  }
+
+  private routePathMatches(routePath: string, requestPath: string): boolean {
+    if (routePath === requestPath) return true;
+    if (routePath.endsWith('/*')) {
+      const prefix = routePath.slice(0, -2);
+      return requestPath === prefix || requestPath.startsWith(prefix + '/');
+    }
+    return false;
+  }
+
+  private routeMethodMatches(routeMethod: string | null, requestMethod: string): boolean {
+    if (!routeMethod || routeMethod === '*') return true;
+    return routeMethod.toUpperCase() === requestMethod.toUpperCase();
   }
 
   private async checkTenantLevel(params: RateLimitCheckParams): Promise<SlidingWindowResult> {
