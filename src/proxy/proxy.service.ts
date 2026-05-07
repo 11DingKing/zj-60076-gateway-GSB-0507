@@ -1,10 +1,19 @@
-import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
-import { RoutesService } from '../routes/routes.service';
-import { LoadBalanceService } from '../load-balance/load-balance.service';
-import { CircuitBreakerService } from '../circuit-breaker/circuit-breaker.service';
-import axios, { AxiosRequestConfig, AxiosResponse } from 'axios';
-import { Request, Response } from 'express';
-import { Route, Service, AuthType } from '@prisma/client';
+import { Injectable, HttpException, HttpStatus } from "@nestjs/common";
+import { RoutesService } from "../routes/routes.service";
+import { LoadBalanceService } from "../load-balance/load-balance.service";
+import { CircuitBreakerService } from "../circuit-breaker/circuit-breaker.service";
+import axios, { AxiosRequestConfig, AxiosResponse } from "axios";
+import { Request, Response } from "express";
+import { Route, Service, AuthType } from "@prisma/client";
+
+interface GrayRule {
+  type: "header" | "percentage" | "ip_whitelist";
+  headerName?: string;
+  headerModulo?: number;
+  headerThreshold?: number;
+  percentage?: number;
+  ipWhitelist?: string[];
+}
 
 @Injectable()
 export class ProxyService {
@@ -20,24 +29,47 @@ export class ProxyService {
     const matchedRoute = await this.routesService.matchRoute(path, method);
 
     if (!matchedRoute) {
-      throw new HttpException('Not Found', HttpStatus.NOT_FOUND);
+      throw new HttpException("Not Found", HttpStatus.NOT_FOUND);
     }
 
     const { service } = matchedRoute;
 
     if (!service.enabled) {
-      throw new HttpException('Service Unavailable', HttpStatus.SERVICE_UNAVAILABLE);
+      throw new HttpException(
+        "Service Unavailable",
+        HttpStatus.SERVICE_UNAVAILABLE,
+      );
     }
 
-    const isCircuitOpen = await this.circuitBreakerService.isCircuitOpen(service.id);
+    const isCircuitOpen = await this.circuitBreakerService.isCircuitOpen(
+      service.id,
+    );
     if (isCircuitOpen) {
-      throw new HttpException('Service Unavailable (Circuit Breaker)', HttpStatus.SERVICE_UNAVAILABLE);
+      throw new HttpException(
+        "Service Unavailable (Circuit Breaker)",
+        HttpStatus.SERVICE_UNAVAILABLE,
+      );
     }
 
-    const targetUrl = await this.loadBalanceService.getNextInstance(service.id);
+    const clientIp = this.getClientIp(request);
+    const useGrayUpstream = this.shouldUseGrayUpstream(
+      matchedRoute,
+      request,
+      clientIp,
+    );
+
+    let targetUrl: string | null;
+    if (useGrayUpstream && matchedRoute.grayUpstream) {
+      targetUrl = matchedRoute.grayUpstream;
+    } else {
+      targetUrl = await this.loadBalanceService.getNextInstance(service.id);
+    }
 
     if (!targetUrl) {
-      throw new HttpException('No healthy instances available', HttpStatus.SERVICE_UNAVAILABLE);
+      throw new HttpException(
+        "No healthy instances available",
+        HttpStatus.SERVICE_UNAVAILABLE,
+      );
     }
 
     const rewrittenPath = this.routesService.rewritePath(
@@ -52,18 +84,23 @@ export class ProxyService {
       const axiosConfig: AxiosRequestConfig = {
         method: method.toLowerCase() as any,
         url: fullTargetUrl,
-        headers: this.prepareHeaders(headers, matchedRoute.extraHeaders as Record<string, string>),
+        headers: this.prepareHeaders(
+          headers,
+          matchedRoute.extraHeaders as Record<string, string>,
+        ),
         data: body,
         timeout: service.timeout,
         validateStatus: () => true,
-        responseType: 'stream',
+        responseType: "stream",
       };
 
       const startTime = Date.now();
       const axiosResponse = await axios(axiosConfig);
       const duration = Date.now() - startTime;
 
-      await this.circuitBreakerService.recordSuccess(service.id);
+      if (!useGrayUpstream) {
+        await this.circuitBreakerService.recordSuccess(service.id);
+      }
 
       response.status(axiosResponse.status);
       this.copyResponseHeaders(axiosResponse, response);
@@ -76,27 +113,114 @@ export class ProxyService {
         routeId: matchedRoute.id,
         statusCode: axiosResponse.status,
         duration,
+        grayRouted: useGrayUpstream,
       };
     } catch (error) {
-      await this.circuitBreakerService.recordFailure(service.id);
+      if (!useGrayUpstream) {
+        await this.circuitBreakerService.recordFailure(service.id);
+      }
 
       const errorCode = (error as any).code;
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
 
-      if (errorCode === 'ECONNABORTED') {
-        throw new HttpException('Gateway Timeout', HttpStatus.GATEWAY_TIMEOUT);
+      if (errorCode === "ECONNABORTED") {
+        throw new HttpException("Gateway Timeout", HttpStatus.GATEWAY_TIMEOUT);
       }
 
       throw new HttpException(
-        'Bad Gateway: ' + errorMessage,
+        "Bad Gateway: " + errorMessage,
         HttpStatus.BAD_GATEWAY,
       );
     }
   }
 
+  private shouldUseGrayUpstream(
+    route: Route,
+    request: Request,
+    clientIp: string,
+  ): boolean {
+    if (!route.grayRules || !route.grayUpstream) {
+      return false;
+    }
+
+    let grayRules: GrayRule[];
+    try {
+      grayRules = Array.isArray(route.grayRules)
+        ? (route.grayRules as unknown as GrayRule[])
+        : [route.grayRules as unknown as GrayRule];
+    } catch {
+      return false;
+    }
+
+    for (const rule of grayRules) {
+      switch (rule.type) {
+        case "header":
+          if (this.matchHeaderRule(rule, request)) {
+            return true;
+          }
+          break;
+        case "percentage":
+          if (this.matchPercentageRule(rule)) {
+            return true;
+          }
+          break;
+        case "ip_whitelist":
+          if (this.matchIpWhitelistRule(rule, clientIp)) {
+            return true;
+          }
+          break;
+      }
+    }
+
+    return false;
+  }
+
+  private matchHeaderRule(rule: GrayRule, request: Request): boolean {
+    if (!rule.headerName) return false;
+
+    const headerValue = request.headers[rule.headerName.toLowerCase()];
+    if (!headerValue) return false;
+
+    if (rule.headerModulo !== undefined && rule.headerThreshold !== undefined) {
+      const numericPart = parseInt(String(headerValue).replace(/\D/g, ""), 10);
+      if (isNaN(numericPart)) return false;
+      return numericPart % rule.headerModulo < rule.headerThreshold;
+    }
+
+    return true;
+  }
+
+  private matchPercentageRule(rule: GrayRule): boolean {
+    if (rule.percentage === undefined) return false;
+    return Math.random() * 100 < rule.percentage;
+  }
+
+  private matchIpWhitelistRule(rule: GrayRule, clientIp: string): boolean {
+    if (!rule.ipWhitelist || rule.ipWhitelist.length === 0) return false;
+    return rule.ipWhitelist.includes(clientIp);
+  }
+
+  private getClientIp(request: Request): string {
+    const forwardedFor = request.headers["x-forwarded-for"];
+    if (forwardedFor) {
+      const ips = Array.isArray(forwardedFor)
+        ? forwardedFor[0]
+        : forwardedFor.split(",")[0];
+      return ips.trim();
+    }
+
+    const realIp = request.headers["x-real-ip"];
+    if (realIp) {
+      return Array.isArray(realIp) ? realIp[0] : realIp;
+    }
+
+    return request.ip || "127.0.0.1";
+  }
+
   private buildTargetUrl(baseUrl: string, path: string): string {
-    const cleanBaseUrl = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
-    const cleanPath = path.startsWith('/') ? path : '/' + path;
+    const cleanBaseUrl = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
+    const cleanPath = path.startsWith("/") ? path : "/" + path;
     return cleanBaseUrl + cleanPath;
   }
 
@@ -106,9 +230,9 @@ export class ProxyService {
   ): Record<string, any> {
     const headers = { ...originalHeaders };
 
-    delete headers['host'];
-    delete headers['content-length'];
-    delete headers['connection'];
+    delete headers["host"];
+    delete headers["content-length"];
+    delete headers["connection"];
 
     if (extraHeaders) {
       Object.entries(extraHeaders).forEach(([key, value]) => {
@@ -119,8 +243,16 @@ export class ProxyService {
     return headers;
   }
 
-  private copyResponseHeaders(axiosResponse: AxiosResponse, response: Response): void {
-    const headersToSkip = ['content-length', 'transfer-encoding', 'connection', 'keep-alive'];
+  private copyResponseHeaders(
+    axiosResponse: AxiosResponse,
+    response: Response,
+  ): void {
+    const headersToSkip = [
+      "content-length",
+      "transfer-encoding",
+      "connection",
+      "keep-alive",
+    ];
 
     Object.entries(axiosResponse.headers).forEach(([key, value]) => {
       if (!headersToSkip.includes(key.toLowerCase()) && value) {

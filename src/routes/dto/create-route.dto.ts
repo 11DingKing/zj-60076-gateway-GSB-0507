@@ -1,5 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsString, IsOptional, IsBoolean, IsEnum, IsObject } from 'class-validator';
+import { IsString, IsOptional, IsBoolean, IsEnum, IsObject, IsInt, Min } from 'class-validator';
 import { AuthType } from '@prisma/client';
 
 export class CreateRouteDto {
@@ -35,4 +35,39 @@ export class CreateRouteDto {
   @IsOptional()
   @IsObject()
   extraHeaders?: Record<string, string>;
+
+  @ApiProperty({ description: '路由级 QPS 上限', required: false })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  rateLimitQps?: number;
+
+  @ApiProperty({ description: 'IP 级 QPS 上限', required: false })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  ipRateLimitQps?: number;
+
+  @ApiProperty({ description: '租户 ID', required: false })
+  @IsOptional()
+  @IsString()
+  tenantId?: string;
+
+  @ApiProperty({
+    description: '灰度规则 JSON 数组，支持 header/percentage/ip_whitelist 三种类型',
+    required: false,
+    example: [
+      { type: 'header', headerName: 'X-User-Id', headerModulo: 100, headerThreshold: 20 },
+      { type: 'percentage', percentage: 10 },
+      { type: 'ip_whitelist', ipWhitelist: ['127.0.0.1', '192.168.1.1'] },
+    ],
+  })
+  @IsOptional()
+  @IsObject()
+  grayRules?: any;
+
+  @ApiProperty({ description: '灰度上游地址', required: false, example: 'http://gray-service:8080' })
+  @IsOptional()
+  @IsString()
+  grayUpstream?: string;
 }
