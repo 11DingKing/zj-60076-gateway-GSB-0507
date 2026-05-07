@@ -67,6 +67,9 @@ model Route {
   authType    AuthType  @default(NONE)
   enabled     Boolean   @default(true)
   extraHeaders Json?
+  rateLimitQps Int?
+  grayRules   Json?
+  grayUpstream String?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
   
@@ -88,6 +91,28 @@ model RateLimitRule {
   updatedAt   DateTime  @updatedAt
   
   @@map("rate_limit_rules")
+}
+
+model TenantRateLimit {
+  id          String    @id @default(uuid())
+  tenantId    String    @unique
+  qpsLimit    Int
+  enabled     Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  
+  @@map("tenant_rate_limits")
+}
+
+model IpRateLimit {
+  id          String    @id @default(uuid())
+  ip          String    @unique
+  qpsLimit    Int
+  enabled     Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  
+  @@map("ip_rate_limits")
 }
 
 model ApiKey {

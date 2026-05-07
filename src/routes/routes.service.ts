@@ -17,10 +17,24 @@ export class RoutesService {
       throw new NotFoundException(`Service with id '${createRouteDto.serviceId}' not found`);
     }
 
+    const data: any = {
+      serviceId: createRouteDto.serviceId,
+      path: createRouteDto.path,
+      method: createRouteDto.method,
+      rewritePath: createRouteDto.rewritePath,
+      authType: createRouteDto.authType,
+      enabled: createRouteDto.enabled,
+      extraHeaders: createRouteDto.extraHeaders,
+      rateLimitQps: createRouteDto.rateLimitQps,
+      grayUpstream: createRouteDto.grayUpstream,
+    };
+
+    if (createRouteDto.grayRules) {
+      data.grayRules = createRouteDto.grayRules as any;
+    }
+
     return this.prisma.route.create({
-      data: {
-        ...createRouteDto,
-      },
+      data,
       include: {
         service: true,
       },
@@ -56,12 +70,26 @@ export class RoutesService {
   async update(id: string, updateRouteDto: UpdateRouteDto) {
     await this.findOne(id);
 
+    const data: any = {
+      serviceId: updateRouteDto.serviceId,
+      path: updateRouteDto.path,
+      method: updateRouteDto.method,
+      rewritePath: updateRouteDto.rewritePath,
+      authType: updateRouteDto.authType,
+      enabled: updateRouteDto.enabled,
+      extraHeaders: updateRouteDto.extraHeaders,
+      rateLimitQps: updateRouteDto.rateLimitQps,
+      grayUpstream: updateRouteDto.grayUpstream,
+      updatedAt: new Date(),
+    };
+
+    if (updateRouteDto.grayRules !== undefined) {
+      data.grayRules = updateRouteDto.grayRules as any;
+    }
+
     return this.prisma.route.update({
       where: { id },
-      data: {
-        ...updateRouteDto,
-        updatedAt: new Date(),
-      },
+      data,
       include: {
         service: true,
       },
