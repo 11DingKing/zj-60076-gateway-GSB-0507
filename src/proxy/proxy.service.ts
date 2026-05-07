@@ -1,15 +1,17 @@
-import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
-import { RoutesService } from '../routes/routes.service';
-import { LoadBalanceService } from '../load-balance/load-balance.service';
-import { CircuitBreakerService } from '../circuit-breaker/circuit-breaker.service';
-import axios, { AxiosRequestConfig, AxiosResponse } from 'axios';
-import { Request, Response } from 'express';
-import { Route, Service, AuthType } from '@prisma/client';
+import { Injectable, HttpException, HttpStatus } from "@nestjs/common";
+import { RoutesService } from "../routes/routes.service";
+import { GrayRouteService } from "../routes/gray-route.service";
+import { LoadBalanceService } from "../load-balance/load-balance.service";
+import { CircuitBreakerService } from "../circuit-breaker/circuit-breaker.service";
+import axios, { AxiosRequestConfig, AxiosResponse } from "axios";
+import { Request, Response } from "express";
+import { Route, Service, AuthType } from "@prisma/client";
 
 @Injectable()
 export class ProxyService {
   constructor(
     private routesService: RoutesService,
+    private grayRouteService: GrayRouteService,
     private loadBalanceService: LoadBalanceService,
     private circuitBreakerService: CircuitBreakerService,
   ) {}
@@ -20,24 +22,48 @@ export class ProxyService {
     const matchedRoute = await this.routesService.matchRoute(path, method);
 
     if (!matchedRoute) {
-      throw new HttpException('Not Found', HttpStatus.NOT_FOUND);
+      throw new HttpException("Not Found", HttpStatus.NOT_FOUND);
     }
 
     const { service } = matchedRoute;
 
     if (!service.enabled) {
-      throw new HttpException('Service Unavailable', HttpStatus.SERVICE_UNAVAILABLE);
+      throw new HttpException(
+        "Service Unavailable",
+        HttpStatus.SERVICE_UNAVAILABLE,
+      );
     }
 
-    const isCircuitOpen = await this.circuitBreakerService.isCircuitOpen(service.id);
+    const isCircuitOpen = await this.circuitBreakerService.isCircuitOpen(
+      service.id,
+    );
     if (isCircuitOpen) {
-      throw new HttpException('Service Unavailable (Circuit Breaker)', HttpStatus.SERVICE_UNAVAILABLE);
+      throw new HttpException(
+        "Service Unavailable (Circuit Breaker)",
+        HttpStatus.SERVICE_UNAVAILABLE,
+      );
     }
 
-    const targetUrl = await this.loadBalanceService.getNextInstance(service.id);
+    const goToGray = this.grayRouteService.shouldRouteToGray(
+      matchedRoute.grayRules as any,
+      matchedRoute.grayUpstream,
+      request,
+    );
 
-    if (!targetUrl) {
-      throw new HttpException('No healthy instances available', HttpStatus.SERVICE_UNAVAILABLE);
+    let targetUrl: string;
+    if (goToGray && matchedRoute.grayUpstream) {
+      targetUrl = matchedRoute.grayUpstream;
+    } else {
+      const instanceUrl = await this.loadBalanceService.getNextInstance(
+        service.id,
+      );
+      if (!instanceUrl) {
+        throw new HttpException(
+          "No healthy instances available",
+          HttpStatus.SERVICE_UNAVAILABLE,
+        );
+      }
+      targetUrl = instanceUrl;
     }
 
     const rewrittenPath = this.routesService.rewritePath(
@@ -52,11 +78,14 @@ export class ProxyService {
       const axiosConfig: AxiosRequestConfig = {
         method: method.toLowerCase() as any,
         url: fullTargetUrl,
-        headers: this.prepareHeaders(headers, matchedRoute.extraHeaders as Record<string, string>),
+        headers: this.prepareHeaders(
+          headers,
+          matchedRoute.extraHeaders as Record<string, string>,
+        ),
         data: body,
         timeout: service.timeout,
         validateStatus: () => true,
-        responseType: 'stream',
+        responseType: "stream",
       };
 
       const startTime = Date.now();
@@ -81,22 +110,23 @@ export class ProxyService {
       await this.circuitBreakerService.recordFailure(service.id);
 
       const errorCode = (error as any).code;
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
 
-      if (errorCode === 'ECONNABORTED') {
-        throw new HttpException('Gateway Timeout', HttpStatus.GATEWAY_TIMEOUT);
+      if (errorCode === "ECONNABORTED") {
+        throw new HttpException("Gateway Timeout", HttpStatus.GATEWAY_TIMEOUT);
       }
 
       throw new HttpException(
-        'Bad Gateway: ' + errorMessage,
+        "Bad Gateway: " + errorMessage,
         HttpStatus.BAD_GATEWAY,
       );
     }
   }
 
   private buildTargetUrl(baseUrl: string, path: string): string {
-    const cleanBaseUrl = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
-    const cleanPath = path.startsWith('/') ? path : '/' + path;
+    const cleanBaseUrl = baseUrl.endsWith("/") ? baseUrl.slice(0, -1) : baseUrl;
+    const cleanPath = path.startsWith("/") ? path : "/" + path;
     return cleanBaseUrl + cleanPath;
   }
 
@@ -106,9 +136,9 @@ export class ProxyService {
   ): Record<string, any> {
     const headers = { ...originalHeaders };
 
-    delete headers['host'];
-    delete headers['content-length'];
-    delete headers['connection'];
+    delete headers["host"];
+    delete headers["content-length"];
+    delete headers["connection"];
 
     if (extraHeaders) {
       Object.entries(extraHeaders).forEach(([key, value]) => {
@@ -119,8 +149,16 @@ export class ProxyService {
     return headers;
   }
 
-  private copyResponseHeaders(axiosResponse: AxiosResponse, response: Response): void {
-    const headersToSkip = ['content-length', 'transfer-encoding', 'connection', 'keep-alive'];
+  private copyResponseHeaders(
+    axiosResponse: AxiosResponse,
+    response: Response,
+  ): void {
+    const headersToSkip = [
+      "content-length",
+      "transfer-encoding",
+      "connection",
+      "keep-alive",
+    ];
 
     Object.entries(axiosResponse.headers).forEach(([key, value]) => {
       if (!headersToSkip.includes(key.toLowerCase()) && value) {
