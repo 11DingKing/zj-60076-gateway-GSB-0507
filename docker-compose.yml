@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  postgresql:
+    image: postgres:15-alpine
+    container_name: zj-60076-postgres
+    environment:
+      POSTGRES_DB: db_zj_60076
+      POSTGRES_USER: dev
+      POSTGRES_PASSWORD: dev123456
+    ports:
+      - "15076:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: zj-60076-redis
+    ports:
+      - "16376:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
